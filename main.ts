@@ -1,7 +1,8 @@
 // Token Launch Radar — the entrypoint (Node 22, standard library only).
 //
-// Reads the sealed snapshot at /input/snapshot.json (or --input <file|dir>), scores every
-// rankable pre-token protocol with the model in lib/model.ts, writes the ranked board to
+// Reads the sealed snapshot at /input/snapshot.json (or --input <file|dir>), validates it
+// and the board it builds before writing anything, scores every rankable pre-token
+// protocol with the model in lib/model.ts, writes the ranked board to
 // /output/board.json, writes the dashboard's data beside the page as /output/data.js,
 // copies dashboard/ and screenshots/ into /output, and writes /output/dossier.json with
 // the vendored make.fun library. The program runs twice and must write the same bytes
@@ -14,6 +15,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSyn
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import type { BoardRow, Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -38,6 +40,58 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+/** The smallest snapshot the model can score: the gate's board floor. */
+const MIN_PROTOCOLS = 100;
+
+/**
+ * Pre-flight validation of the sealed snapshot, before anything is written: the
+ * snapshot must hold enough protocols to rank, and every watchlist slug must name a
+ * protocol in it. A watchlist slug with no protocol behind it would silently drop
+ * out of the board and fail the gate's coverage row, so it is refused here, by name.
+ */
+function validateSnapshot(snapshot: Snapshot): void {
+  if (!Array.isArray(snapshot.protocols) || snapshot.protocols.length < MIN_PROTOCOLS) {
+    fail(
+      `pre-flight: the snapshot holds ${Array.isArray(snapshot.protocols) ? snapshot.protocols.length : 0} protocols, fewer than the ${MIN_PROTOCOLS} the board needs`,
+    );
+  }
+  if (!Array.isArray(snapshot.watchlist) || snapshot.watchlist.length === 0) {
+    fail('pre-flight: the snapshot names no watchlist');
+  }
+  const slugs = new Set(snapshot.protocols.map((p) => p.slug));
+  const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
+  if (missing.length > 0) {
+    fail(
+      `pre-flight: ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'} name${missing.length === 1 ? 's' : ''} no protocol in the snapshot: ${missing.slice(0, 5).join(', ')}`,
+    );
+  }
+}
+
+/**
+ * Pre-flight validation of the built board, before anything is written: the board
+ * must cover every watchlist slug, carry ranks exactly 1..N once each, and keep its
+ * implied values non-increasing with rank, so rank 1 is the most valuable protocol.
+ * The gate's shape, checked here in the entrypoint's own words.
+ */
+function validateBoard(board: BoardRow[], snapshot: Snapshot): void {
+  const slugs = new Set(board.map((r) => r.slug));
+  const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
+  if (missing.length > 0) {
+    fail(`pre-flight: the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`);
+  }
+  const ranks = board.map((r) => r.rank).sort((a, b) => a - b);
+  for (let i = 0; i < ranks.length; i++) {
+    if (ranks[i] !== i + 1) fail(`pre-flight: the board's ranks are not 1..${board.length} once each: rank ${i + 1} is ${ranks[i]}`);
+  }
+  for (let i = 1; i < board.length; i++) {
+    if (board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) {
+      fail(
+        `pre-flight: row ${i + 1} (${board[i]!.slug}, $${board[i]!.implied_value_usd}) outranks row ${i} (${board[i - 1]!.slug}, $${board[i - 1]!.implied_value_usd}) on implied value`,
+      );
+    }
+  }
+}
+
 const inputArg = flag('input', '/input');
 const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
 if (!existsSync(inputFile)) {
@@ -51,7 +105,9 @@ try {
 } catch (error) {
   fail(`the snapshot does not parse: ${error instanceof Error ? error.message : String(error)}`);
 }
+validateSnapshot(snapshot);
 const { board, radar } = buildRadar(snapshot);
+validateBoard(board, snapshot);
 const issue = boardIssue(board, snapshot);
 if (issue !== null) fail(`the model wrote a board the gate refuses: ${issue}`);
 
